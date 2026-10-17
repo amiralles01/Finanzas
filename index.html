@@ -867,6 +867,14 @@
       </div>
     </div>
     <div class="section">
+      <div class="section-head"><h2 class="section-title">Apuestas</h2></div>
+      <p class="section-sub">El profit de cada día de tu app de apuestas se suma como un movimiento a la cuenta que elijas. No copia el dinero de las casas ni depende de tus saldos: solo añade lo ganado o perdido, y si cambias o borras una apuesta allí, se corrige aquí. No toca nada más.</p>
+      <div class="list-box">
+        <div class="settings-row"><div><span id="bets-status">No conectado</span><small id="bets-sub">Conecta tu cuenta de Google de la app de apuestas</small></div><button type="button" class="pill-btn is-primary" id="bets-connect">Conectar</button></div>
+        <div class="settings-row" id="bets-acc-row" hidden><div>Cuenta donde se suma<small>Suma o resta el profit de cada día; no cuenta como ingreso ni gasto</small></div><select class="input" id="bets-acc" style="max-width:190px"></select></div>
+      </div>
+    </div>
+    <div class="section">
       <div class="section-head"><h2 class="section-title">Sesión</h2></div>
       <div class="list-box">
         <div class="settings-row"><div><span id="user-name"></span><small id="user-email"></small></div><button type="button" class="pill-btn" id="signout">Cerrar sesión</button></div>
@@ -1266,6 +1274,7 @@
         if (k === 'cats' && snap.empty && !snap.metadata.fromCache) seedCategories();
         if ((k === 'inv' || k === 'ajustes') && ready()) refreshPrices();
         scheduleRender();
+        if (k === 'movs' || k === 'cuentas' || k === 'cats' || k === 'ajustes') scheduleBetsSync();
       }, (err) => {
         console.error(err);
         loaded.add(k);
@@ -1341,6 +1350,7 @@
   function catOf(m) {
     if (m.inversionId) return { nombre: 'Inversión', emoji: '📈' };
     if (m.tipo === 'transferencia') return { nombre: 'Transferencia', emoji: '⇄' };
+    if (m.autoApuestas) return { nombre: 'Apuestas', emoji: '🎯' };
     if (m.ajuste) return { nombre: 'Ajuste de saldo', emoji: '⚖️' };
     return catById.get(m.categoriaId) || { nombre: 'Sin categoría', emoji: '•' };
   }
@@ -4826,6 +4836,100 @@ export default {
     });
   }
 
+  // ============================================================
+  // Apuestas → cuenta «Apuestas» (lee la app de apuestas, nunca escribe en ella)
+  // ============================================================
+  const BETS_CONFIG = {
+    apiKey: "AIzaSyBnJ5fne_yyf3s2aXZPaI5Azm5chwibJS0",
+    authDomain: "calculadora-a719f.firebaseapp.com",
+    projectId: "calculadora-a719f",
+    storageBucket: "calculadora-a719f.firebasestorage.app",
+    messagingSenderId: "597066196263",
+    appId: "1:597066196263:web:e78b380d8af8e2ac30b502"
+  };
+  let betsAuth = null, betsDb = null, betsUser = null, betsData = null, betsUnsub = null, betsErr = '', betsTimer = null;
+  const betsPath = (email) => (email || '').trim().toLowerCase().replace(/[@.]/g, '_');
+  // Mismo cálculo que el calendario de la app de apuestas: profit resuelto por día, sin ocultas
+  function betsDaily(d) {
+    const out = new Map();
+    if (!d) return out;
+    const hid = d.hidden || {};
+    const add = (f, v) => { if (!/^\d{4}-\d{2}-\d{2}$/.test(f || '') || !v) return; out.set(f, (out.get(f) || 0) + v); };
+    (d.bets || []).forEach(b => { if (hid['sb:' + b.id]) return; if (b.status === 'won' || b.status === 'lost') add(b.date || b.resolveDate, Number(b.profit) || 0); });
+    (d.normals || []).forEach(n => { if (hid['nm:' + n.id]) return; add(n.date || n.resolveDate, Number(n.profit) || 0); });
+    for (const [k, v] of out) { const r = round2(v); if (Math.abs(r) < 0.005) out.delete(k); else out.set(k, r); }
+    return out;
+  }
+  // Cuenta destino: la elegida en Ajustes, o una cuenta «Apuestas» propia si no has elegido ninguna
+  function betsTarget() {
+    const sel = S.ajustes.find(a => a.id === 'apuestas')?.cuentaId;
+    return sel && S.cuentas.some(c => c.id === sel) ? sel : null;
+  }
+  function scheduleBetsSync() { clearTimeout(betsTimer); betsTimer = setTimeout(syncBets, 700); }
+  function syncBets() {
+    if (!currentUser || !betsUser || !betsData || !ready()) return;
+    const target = betsTarget();
+    if (!target) { renderBetsRow(); return; }   // sin cuenta elegida no se escribe nada
+    const daily = betsDaily(betsData);
+    const prev = new Map(S.movs.filter(m => m.autoApuestas).map(m => [m.id, m]));
+    const batch = writeBatch(db); let n = 0;
+    for (const [fecha, v] of daily) {
+      const id = 'apuestas-' + fecha;
+      const want = { tipo: v > 0 ? 'ingreso' : 'gasto', importe: Math.abs(v), cuentaId: target, cuentaDestinoId: null,
+        categoriaId: null, fecha, nota: 'Profit de apuestas del día', ajuste: true, autoApuestas: true };
+      const cur = prev.get(id); prev.delete(id);
+      if (cur && cur.tipo === want.tipo && Number(cur.importe) === want.importe && cur.cuentaId === target && cur.ajuste === true && cur.fecha === fecha) continue;
+      batch.set(docRef('movs', id), { ...want, t: cur?.t || Date.now(), createdAt: serverTimestamp() }); n++;
+    }
+    for (const id of prev.keys()) { batch.delete(docRef('movs', id)); n++; }
+    if (n) batch.commit().catch(fsErr);
+    renderBetsRow();
+  }
+  function renderBetsRow() {
+    const st = $('bets-status'), sub = $('bets-sub'), b = $('bets-connect');
+    if (!st) return;
+    const accRow = $('bets-acc-row'), accSel = $('bets-acc');
+    accRow.hidden = !betsUser;
+    if (betsUser && document.activeElement !== accSel) {
+      const target = betsTarget();
+      const opts = [['', 'Elige una cuenta…'], ...S.cuentas.filter(c => !isLinked(c) && (!c.archivada || c.id === target)).map(c => [c.id, c.nombre])];
+      accSel.replaceChildren(...opts.map(([v, l]) => { const o = document.createElement('option'); o.value = v; o.textContent = l; o.selected = v === (target || ''); return o; }));
+    }
+    if (!betsUser) { st.textContent = 'No conectado'; sub.textContent = 'Conecta tu cuenta de Google de la app de apuestas'; b.textContent = 'Conectar'; b.classList.add('is-primary'); return; }
+    b.textContent = 'Desconectar'; b.classList.remove('is-primary');
+    if (betsErr) { st.textContent = 'Error al leer las apuestas'; sub.textContent = betsErr; return; }
+    const days = betsDaily(betsData); let tot = 0; for (const v of days.values()) tot += v;
+    st.textContent = !betsTarget() ? 'Conectado · elige la cuenta donde sumar' : `Conectado · ${betsData ? days.size + ' días con resultado' : 'sin datos todavía'}`;
+    sub.textContent = `${betsUser.email} · total ${money(round2(tot))}`;
+  }
+  function initBets() {
+    const app2 = initializeApp(BETS_CONFIG, 'apuestas');
+    betsAuth = getAuth(app2);
+    betsDb = getFirestore(app2);
+    onAuthStateChanged(betsAuth, (u) => {
+      betsUser = u; betsData = null; betsErr = '';
+      if (betsUnsub) { betsUnsub(); betsUnsub = null; }
+      if (u) betsUnsub = onSnapshot(doc(betsDb, 'users', betsPath(u.email), 'app', 'data'),
+        (snap) => { betsErr = ''; betsData = snap.exists() ? snap.data() : null; renderBetsRow(); scheduleBetsSync(); },
+        (err) => { console.error(err); betsErr = describeError(err); renderBetsRow(); });
+      renderBetsRow();
+    });
+    $('bets-acc').addEventListener('change', (e) => {
+      if (!e.target.value) return;
+      setDoc(docRef('ajustes', 'apuestas'), { cuentaId: e.target.value, t: Date.now() }, { merge: true }).catch(fsErr);
+      toast('El profit de apuestas irá a ' + (e.target.selectedOptions[0]?.textContent || 'esa cuenta'));
+    });
+    $('bets-connect').addEventListener('click', () => {
+      if (betsUser) {
+        if (confirm('¿Desconectar la app de apuestas? Los movimientos ya creados se quedan en la cuenta «Apuestas».')) signOut(betsAuth);
+        return;
+      }
+      signInWithPopup(betsAuth, new GoogleAuthProvider()).catch((err) => {
+        if (!/popup-closed|cancelled-popup/.test(err.code || '')) toast(`No se pudo conectar (${err.code || err.message})`);
+      });
+    });
+  }
+
   function init() {
     loadPriceCache();
     const app = initializeApp(firebaseConfig);
@@ -4852,6 +4956,7 @@ export default {
   }
 
   init();
+  initBets();
 </script>
 </body>
 </html>
