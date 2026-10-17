@@ -9,7 +9,7 @@
 <meta name="mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="Finanzas">
-<title>Finanzas,pb</title>
+<title>Finanzas</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23FF7A1F'/%3E%3Ctext x='32' y='45' font-size='36' text-anchor='middle' font-family='Arial' font-weight='700' fill='%230E0D0C'%3E%E2%82%AC%3C/text%3E%3C/svg%3E">
 <link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%23FF7A1F'/%3E%3Ctext x='32' y='45' font-size='36' text-anchor='middle' font-family='Arial' font-weight='700' fill='%230E0D0C'%3E%E2%82%AC%3C/text%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -677,6 +677,7 @@
 
   <!-- INICIO -->
   <section class="view" id="view-inicio">
+    <div id="legacy-box"></div>
     <div class="month-row">
       <div class="month-switch" data-month-switch></div>
     </div>
@@ -803,6 +804,7 @@
       <div class="list-box">
         <div class="settings-row"><div>Exportar movimientos<small>CSV para Excel o Google Sheets</small></div><button type="button" class="pill-btn" id="export-all">Descargar</button></div>
         <div class="settings-row"><div>Copia de seguridad<small>Todo en un archivo JSON</small></div><button type="button" class="pill-btn" id="backup">Descargar</button></div>
+        <div class="settings-row" id="legacy-row" hidden><div>Datos de la versión anterior<small>Cópialos a esta cuenta</small></div><button type="button" class="pill-btn" id="legacy-import">Importar</button></div>
       </div>
     </div>
     <div class="section">
@@ -828,7 +830,7 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.0/firebase-app.js";
   import {
     initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager,
-    collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, writeBatch, serverTimestamp, increment
+    collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, writeBatch, serverTimestamp, increment, getDocs, query, limit
   } from "https://www.gstatic.com/firebasejs/12.17.0/firebase-firestore.js";
   import {
     getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut
@@ -1165,8 +1167,10 @@
   // ============================================================
   // Firestore
   // ============================================================
-  const colRef = (k) => collection(db, COL[k]);
-  const docRef = (k, id) => doc(db, COL[k], id);
+  // Cada cuenta de Google tiene su propio espacio: usuarios/{uid}/...
+  const userRoot = () => ['usuarios', currentUser.uid];
+  const colRef = (k) => collection(db, ...userRoot(), COL[k]);
+  const docRef = (k, id) => doc(db, ...userRoot(), COL[k], id);
   // No esperamos al servidor: con la caché local, la escritura se ve al instante
   // y se sincroniza sola (también sin conexión).
   function addItem(k, data, id = null) {
@@ -1217,14 +1221,51 @@
     listening = false;
     loaded.clear();
     pricesKicked = false;
+    seeding = false;
+    legacy = null;
     for (const k of Object.keys(S)) S[k] = [];
+  }
+
+  // ---------- Datos de la versión anterior (compartidos entre cuentas) ----------
+  let legacy = null;   // null = sin comprobar · false = no hay · true = hay datos antiguos
+  const legacyKey = () => `fin_importado_${currentUser?.uid}`;
+  const legacyDone = () => { try { return localStorage.getItem(legacyKey()) === '1'; } catch { return false; } };
+  async function checkLegacy() {
+    try {
+      let n = 0;
+      for (const k of ['cuentas', 'movs', 'inv', 'pend', 'metas']) n += (await getDocs(query(collection(db, COL[k]), limit(1)))).size;
+      legacy = n > 0;
+    } catch { legacy = false; }
+    scheduleRender();
+  }
+  async function importLegacy() {
+    if (!confirm(`Se copiarán a esta cuenta (${currentUser.email}) los datos guardados con la versión anterior de la app, cuando todas las cuentas compartían los mismos datos.\n\n¿Importarlos?`)) return;
+    try {
+      let total = 0;
+      for (const k of Object.keys(COL)) {
+        const snap = await getDocs(collection(db, COL[k]));
+        for (let i = 0; i < snap.docs.length; i += 450) {
+          const b = writeBatch(db);
+          snap.docs.slice(i, i + 450).forEach(d => b.set(docRef(k, d.id), d.data(), { merge: true }));
+          await b.commit();
+        }
+        total += snap.size;
+      }
+      try { localStorage.setItem(legacyKey(), '1'); } catch { /* sin almacenamiento */ }
+      toast(`Importados ${total} registros a esta cuenta`);
+      scheduleRender();
+    } catch (err) { fsErr(err); }
+  }
+  function dismissLegacy() {
+    try { localStorage.setItem(legacyKey(), '1'); } catch { /* sin almacenamiento */ }
+    scheduleRender();
   }
   function seedCategories() {
     if (seeding) return;
     seeding = true;
     const batch = writeBatch(db);
     DEFAULT_CATS.forEach(([id, nombre, emoji, tipo], i) => {
-      batch.set(doc(db, COL.cats, 'def-' + id), { nombre, emoji, tipo, orden: i, presupuesto: null, t: Date.now() + i });
+      batch.set(docRef('cats', 'def-' + id), { nombre, emoji, tipo, orden: i, presupuesto: null, t: Date.now() + i });
     });
     batch.commit().catch(fsErr);
   }
@@ -1437,6 +1478,14 @@
     }
 
     renderHomeInv();
+    // Aviso para traer los datos de antes, solo si esta cuenta aún está vacía
+    const empty = !S.cuentas.length && !S.movs.length && !S.inv.length;
+    $('legacy-box').replaceChildren(...(legacy === true && empty && !legacyDone() ? [h('div', { class: 'card', style: { marginBottom: '16px', borderColor: 'rgba(255,122,31,.45)' } },
+      h('strong', { style: { display: 'block', marginBottom: '4px' } }, 'Ahora cada cuenta tiene sus propios datos'),
+      h('p', { class: 'field-hint', style: { margin: '0 0 12px' } }, `Esta cuenta (${currentUser?.email || ''}) está vacía. ¿Quieres traer aquí los datos que tenías con la versión anterior?`),
+      h('div', { class: 'btn-row' },
+        h('button', { type: 'button', class: 'btn btn-primary', onclick: importLegacy }, 'Importar mis datos'),
+        h('button', { type: 'button', class: 'btn btn-ghost', onclick: dismissLegacy }, 'Empezar de cero')))] : []));
 
     // Avisos
     $('home-alerts').replaceChildren(...buildAlerts());
@@ -1861,6 +1910,7 @@
     };
     $('cat-list').replaceChildren(...[catGroup('gasto', 'Gastos'), catGroup('ingreso', 'Ingresos')].filter(Boolean).flat());
 
+    $('legacy-row').hidden = legacy !== true;
     $('user-name').textContent = currentUser?.displayName || 'Cuenta de Google';
     $('user-email').textContent = currentUser?.email || '';
   }
@@ -3831,6 +3881,7 @@ export default {
   $('rec-add').addEventListener('click', () => openRecSheet());
   $('meta-add').addEventListener('click', () => openMetaSheet());
   $('cat-add').addEventListener('click', () => openCatSheet());
+  $('legacy-import').addEventListener('click', importLegacy);
   $('signout').addEventListener('click', () => { if (confirm('¿Cerrar sesión?')) signOut(auth); });
 
   // Atajo de teclado: N = nuevo movimiento
@@ -3907,7 +3958,9 @@ export default {
       if (!user) { stopListeners(); showGate('login'); return; }
       if (!ALLOWED_EMAILS.includes(user.email)) { stopListeners(); showGate('denied', user.email); return; }
       showApp();
+      stopListeners();
       startListeners();
+      checkLegacy();
       renderAll();
     });
   }
