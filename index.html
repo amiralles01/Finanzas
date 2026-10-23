@@ -4861,6 +4861,7 @@ export default {
     const add = (f, v) => { if (!/^\d{4}-\d{2}-\d{2}$/.test(f || '') || !v) return; out.set(f, (out.get(f) || 0) + v); };
     (d.bets || []).forEach(b => { if (hid['sb:' + b.id]) return; if (b.status === 'won' || b.status === 'lost') add(b.date || b.resolveDate, Number(b.profit) || 0); });
     (d.normals || []).forEach(n => { if (hid['nm:' + n.id]) return; add(n.date || n.resolveDate, Number(n.profit) || 0); });
+    (d.casas || []).forEach(c => { if (hid['casa:' + c.id]) return; (c.adjLog || []).forEach(x => add(x.date, Number(x.delta) || 0)); }); // ajustes manuales de saldo
     for (const [k, v] of out) { const r = round2(v); if (Math.abs(r) < 0.005) out.delete(k); else out.set(k, r); }
     return out;
   }
