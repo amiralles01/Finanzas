@@ -4861,6 +4861,11 @@ export default {
     const add = (f, v) => { if (!/^\d{4}-\d{2}-\d{2}$/.test(f || '') || !v) return; out.set(f, (out.get(f) || 0) + v); };
     (d.bets || []).forEach(b => { if (hid['sb:' + b.id]) return; if (b.status === 'won' || b.status === 'lost') add(b.date || b.resolveDate, Number(b.profit) || 0); });
     (d.normals || []).forEach(n => { if (hid['nm:' + n.id]) return; add(n.date || n.resolveDate, Number(n.profit) || 0); });
+    // cuentas marcadas (p. ej. el banco): ingresos suman y retiradas restan
+    (d.casas || []).forEach(c => { if (hid['casa:' + c.id] || !c.flowSince) return; (c.history || []).forEach(h => {
+      if ((h.id || 0) < c.flowSince || !(h.amount > 0)) return;
+      if (h.type === 'dep') add(h.date, Number(h.amount)); else if (h.type === 'wd') add(h.date, -Number(h.amount));
+    }); });
     // gastos mensuales de cada casa: un cargo al mes en el día elegido
     const hoy = new Date(); const hoyISO = `${hoy.getFullYear()}-${String(hoy.getMonth() + 1).padStart(2, '0')}-${String(hoy.getDate()).padStart(2, '0')}`;
     (d.casas || []).forEach(c => { if (hid['casa:' + c.id]) return; (c.costs || []).forEach(k => {
