@@ -4862,8 +4862,9 @@ export default {
     (d.bets || []).forEach(b => { if (hid['sb:' + b.id]) return; if (b.status === 'won' || b.status === 'lost') add(b.date || b.resolveDate, Number(b.profit) || 0); });
     (d.normals || []).forEach(n => { if (hid['nm:' + n.id]) return; add(n.date || n.resolveDate, Number(n.profit) || 0); });
     // cuentas marcadas (p. ej. el banco): ingresos suman y retiradas restan
-    (d.casas || []).forEach(c => { if (hid['casa:' + c.id] || !c.flowSince) return; (c.history || []).forEach(h => {
-      if ((h.id || 0) < c.flowSince || !(h.amount > 0)) return;
+    const fromOf = c => { if (c.flowFrom) return c.flowFrom; if (!c.flowSince) return ''; const t = new Date(c.flowSince); return `${t.getFullYear()}-${String(t.getMonth() + 1).padStart(2, '0')}-${String(t.getDate()).padStart(2, '0')}`; };
+    (d.casas || []).forEach(c => { const desde = fromOf(c); if (hid['casa:' + c.id] || !desde) return; (c.history || []).forEach(h => {
+      if (h.init || !(h.amount > 0) || !h.date || h.date < desde) return;
       if (h.type === 'dep') add(h.date, Number(h.amount)); else if (h.type === 'wd') add(h.date, -Number(h.amount));
     }); });
     // gastos mensuales de cada casa: un cargo al mes en el día elegido
