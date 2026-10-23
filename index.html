@@ -4861,10 +4861,11 @@ export default {
     const add = (f, v) => { if (!/^\d{4}-\d{2}-\d{2}$/.test(f || '') || !v) return; out.set(f, (out.get(f) || 0) + v); };
     (d.bets || []).forEach(b => { if (hid['sb:' + b.id]) return; if (b.status === 'won' || b.status === 'lost') add(b.date || b.resolveDate, Number(b.profit) || 0); });
     (d.normals || []).forEach(n => { if (hid['nm:' + n.id]) return; add(n.date || n.resolveDate, Number(n.profit) || 0); });
-    // correcciones de saldo (Set balance) y gastos pagados desde el banco
-    (d.casas || []).forEach(c => { if (hid['casa:' + c.id]) return;
-      (c.adjLog || []).forEach(x => add(x.date, Number(x.delta) || 0));
-      (c.history || []).forEach(h => { if (h.type === 'wd' && h.expense && h.amount > 0) add(h.date, -Number(h.amount)); });
+    // desde el día elegido en Profit («contar toda la banca»): correcciones de saldo, gastos del banco y gastos mensuales
+    const tr = d.track && d.track.from ? d.track : null;
+    if (tr) (d.casas || []).forEach(c => { if (hid['casa:' + c.id]) return;
+      (c.adjLog || []).forEach(x => { if (x.date >= tr.from && (x.id || 0) >= tr.setAt) add(x.date, Number(x.delta) || 0); });
+      (c.history || []).forEach(h => { if (h.type === 'wd' && h.expense && h.amount > 0 && h.date >= tr.from) add(h.date, -Number(h.amount)); });
     });
     // gastos mensuales de cada casa: un cargo al mes en el día elegido
     const hoy = new Date(); const hoyISO = `${hoy.getFullYear()}-${String(hoy.getMonth() + 1).padStart(2, '0')}-${String(hoy.getDate()).padStart(2, '0')}`;
@@ -4873,7 +4874,7 @@ export default {
       for (let i = 0; i < 600; i++) {
         const ym = `${y}-${String(m).padStart(2, '0')}`; if (k.until && ym > k.until) break;
         const f = `${ym}-${String(Math.min(k.day || 1, new Date(y, m, 0).getDate())).padStart(2, '0')}`;
-        if (f > hoyISO) break; if (f >= (k.start || '0')) add(f, -k.amount);
+        if (f > hoyISO) break; if (tr && f >= tr.from && f >= (k.start || '0')) add(f, -k.amount);
         m++; if (m > 12) { m = 1; y++; }
       }
     }); });
