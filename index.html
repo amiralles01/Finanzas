@@ -2841,6 +2841,7 @@ export default {
     for (const p of list) {
       const d = PX.get(p.simbolo);
       if (!d?.price) continue;
+      if (manualAhead(p, d)) continue;   // no pises un precio manual más reciente con uno atrasado
       const cur = d.currency || 'EUR';
       const fx = cur === 'EUR' ? 1 : FXR.get(cur)?.rate ?? null;
       const age = Date.now() - (p.precioAt || 0);
@@ -2854,9 +2855,13 @@ export default {
   const num = (v) => Number(v) || 0;
   const curOf = (p) => PX.get(p.simbolo)?.currency || p.moneda || 'EUR';
   const lastOp = (p) => opsOf(p).filter(o => o.precio > 0).at(-1);
+  // Un precio puesto a mano para una fecha más reciente que los datos de la cotización sigue valiendo
+  // hasta que la cotización alcanza esa fecha (los fondos suelen publicar el precio con un día de retraso)
+  const manualAhead = (p, d) => !!(p.precioManualAt && p.ultimoPrecio != null && p.precioFecha && d?.lastDate && d.lastDate < p.precioFecha);
   function priceNow(p) {
     const d = PX.get(p.simbolo);
     if (p.precioFijo && p.ultimoPrecio != null) return p.ultimoPrecio;
+    if (manualAhead(p, d)) return p.ultimoPrecio;
     if (d?.price != null && (!p.precioManualAt || d.t > p.precioManualAt)) return d.price;
     return p.ultimoPrecio ?? lastOp(p)?.precio ?? null;
   }
@@ -2875,9 +2880,23 @@ export default {
     return 'última sesión';
   }
   // Comisiones anuales que se descuentan día a día (servicio + gestión si no va ya en el precio)
+  // (la comisión de servicio marcada como «cobrada aparte» no se resta del valor: la cobra la plataforma de tu cuenta)
   function feeRate(p, withFees = true) {
     if (!withFees || p.valoracion === 'manual') return 0;
-    return Math.max(0, num(p.comServicio) + (p.gestionEnPrecio ? 0 : num(p.comGestion))) / 100;
+    return Math.max(0, (p.comServicioAparte ? 0 : num(p.comServicio)) + (p.gestionEnPrecio ? 0 : num(p.comGestion))) / 100;
+  }
+  // Comisión de servicio que la plataforma cobra aparte (no afecta al valor, sí al coste)
+  const serviceApart = (p) => (p.valoracion !== 'manual' && p.comServicioAparte) ? Math.max(0, num(p.comServicio)) / 100 : 0;
+  // Estimación de lo acumulado hasta hoy por esa comisión (sobre lo aportado, día a día)
+  function serviceAccrued(p, date, ops = opsOf(p)) {
+    const r = serviceApart(p);
+    if (!(r > 0)) return 0;
+    let t = 0;
+    for (const o of ops) {
+      if (o.fecha > date) break;
+      t += (o.tipo === 'venta' ? -1 : 1) * num(o.importe) * Math.max(0, dayDiff(o.fecha, date)) / 365;
+    }
+    return Math.max(0, t * r);
   }
   const decay = (f, days) => f > 0 ? Math.pow(1 - f, Math.max(0, days) / 365) : 1;
   const opBase = (o) => o.tipo === 'venta' ? -(num(o.importe) + num(o.comision)) : (num(o.importe) - num(o.comision));
@@ -2939,7 +2958,8 @@ export default {
     valor = round2(valor);
     const ganancia = round2(valor + retirado - aportado);
     return {
-      valor, comisiones: Math.max(0, round2(valorSin - valor)), costeAnual: round2(valor * feeRate(p)),
+      valor, comisiones: Math.max(0, round2(valorSin - valor)), costeAnual: round2(valor * (feeRate(p) + serviceApart(p))),
+      servicioEst: round2(serviceAccrued(p, today, ops)),
       aportado: round2(aportado), retirado: round2(retirado), ganancia,
       gananciaPct: aportado > 0 ? ganancia / aportado : null,
       hoy, hoyPct, unidades, precio, fx, cur, sinPrecio,
@@ -3356,6 +3376,9 @@ export default {
     const cot = p.valoracion === 'cotizacion';
     const px = cot ? PX.get(p.simbolo) : null;
     const wrap = h('div');
+    // Fecha del precio que se está usando (la de la cotización, o la que pusiste a mano)
+    const pxManual = cot && !!(p.precioFijo || manualAhead(p, px));
+    const pxDate = !cot ? null : (pxManual ? p.precioFecha : (px?.lastDate || p.precioFecha || null));
 
     if (cot) {
       wrap.append(
@@ -3363,7 +3386,8 @@ export default {
           h('strong', { class: 'money' }, s.precio != null ? fmtPrice(s.precio, s.cur) : 'Sin precio'),
           s.precio != null && prevPrice(p) ? deltaEl(null, s.precio / prevPrice(p) - 1, px?.lastDate === dateStr() ? 'hoy' : 'última sesión') : null),
         h('p', { class: 'detail-meta' }, [p.simbolo, px?.exchange || p.bolsa, ASSET_TYPES[p.tipoActivo],
-          px?.t ? `precio ${relTime(px.t)}` : p.precioAt ? `precio ${relTime(p.precioAt)}` : 'precio manual'].filter(Boolean).join(' · ')));
+          px?.t ? `precio ${relTime(px.t)}` : p.precioAt ? `precio ${relTime(p.precioAt)}` : 'precio manual',
+          s.precio != null && pxDate ? `cierre del ${shortDate(pxDate)}${pxManual ? ' (a mano)' : ''}` : null].filter(Boolean).join(' · ')));
       if (px?.series?.length > 2) {
         const all = px.series.map(r => r[0]);
         const from = sliceRange(all, detailRange);
@@ -3400,7 +3424,8 @@ export default {
     }
     if (p.valoracion !== 'manual') {
       stats.push(['Comisiones pagadas', money(s.comisiones), `≈ ${money(s.costeAnual)} al año`]);
-      stats.push(['Comisión de servicio', fmtRate(p.comServicio), 'anual']);
+      if (p.comServicioAparte) stats.push(['Servicio de la plataforma', money(s.servicioEst), 'estimado desde el inicio · se cobra aparte']);
+      stats.push(['Comisión de servicio', fmtRate(p.comServicio), p.comServicioAparte ? 'anual · cobrada aparte, no resta del valor' : 'anual']);
       stats.push(['Comisión de gestión', fmtRate(p.comGestion), p.gestionEnPrecio ? 'ya incluida en el precio' : 'anual']);
     }
     wrap.append(h('div', { class: 'stat-grid' }, stats.map(([k, v, sub]) => h('div', { class: 'stat' }, h('span', {}, k), h('strong', { class: 'money' }, v), sub ? h('small', {}, sub) : null))));
@@ -3593,18 +3618,25 @@ export default {
     const comGest = h('input', { class: 'input', inputmode: 'decimal', placeholder: '0', value: numInput(p?.comGestion, 3) });
     const enPrecio = h('input', { type: 'checkbox', checked: !!p?.gestionEnPrecio });
     const enPrecioText = h('span');
+    const servAparte = h('input', { type: 'checkbox', checked: !!p?.comServicioAparte });
     const feeHint = h('p', { class: 'field-hint', style: { margin: '-6px 0 14px' } });
     const updFee = () => {
-      const f = num(parseNum(comServ.value)) + (enPrecio.checked ? 0 : num(parseNum(comGest.value)));
-      feeHint.textContent = f > 0 ? `Se descuenta un ${fmtRate(f)} anual del valor, día a día: unos ${money(f * 10)} al año por cada 1.000 €.` : 'Sin comisiones anuales.';
+      const cs = num(parseNum(comServ.value));
+      const f = (servAparte.checked ? 0 : cs) + (enPrecio.checked ? 0 : num(parseNum(comGest.value)));
+      const partes = [];
+      partes.push(f > 0 ? `Se descuenta un ${fmtRate(f)} anual del valor, día a día: unos ${money(f * 10)} al año por cada 1.000 €.` : 'No se descuenta nada del valor.');
+      if (servAparte.checked && cs > 0) partes.push(`La plataforma te cobra aparte un ${fmtRate(cs)} anual (unos ${money(cs * 10)} al año por cada 1.000 €): cuenta como coste, pero apúntalo como gasto cuando te lo cobren.`);
+      feeHint.textContent = partes.join(' ');
     };
     [comServ, comGest].forEach(i => i.addEventListener('input', updFee));
     enPrecio.addEventListener('change', updFee);
+    servAparte.addEventListener('change', updFee);
     const feeBox = h('div', {},
       h('p', { class: 'sub-title' }, 'Comisiones anuales'),
       h('div', { class: 'row2' },
         field('Comisión de servicio (%)', comServ, 'La de la plataforma.'),
         field('Comisión de gestión (%)', comGest, 'La del fondo o ETF (TER).')),
+      h('label', { class: 'check-field' }, servAparte, h('span', {}, 'La plataforma cobra la comisión de servicio aparte, de tu cuenta (no se resta del valor)')),
       h('label', { class: 'check-field' }, enPrecio, enPrecioText), feeHint);
 
     // Primera aportación (solo al crear)
@@ -3664,7 +3696,7 @@ export default {
         nombre: n, valoracion: st.val, simbolo: sym || null, moneda: cur, bolsa: cot ? st.bolsa : '',
         tipoActivo: cot ? tipoSel.value : (st.val === 'interes' ? 'otro' : 'otro'),
         cuentaId: plat || null, comServicio: st.val === 'manual' ? 0 : cs, comGestion: st.val === 'manual' ? 0 : cg,
-        gestionEnPrecio: enPrecio.checked, interes: r,
+        gestionEnPrecio: enPrecio.checked, comServicioAparte: st.val !== 'manual' && servAparte.checked, interes: r,
       };
       if (pa !== null) Object.assign(data, { ultimoPrecio: pa, precioManualAt: Date.now(), precioAt: Date.now() });
 
@@ -3845,7 +3877,10 @@ export default {
     const valor = h('input', { class: 'input money', inputmode: 'decimal', placeholder: manual ? 'Valor total en €' : `Precio en ${cur}`, value: manual ? amountToInput(s.valor) : numInput(s.precio, 4) });
     const fecha = h('input', { type: 'date', class: 'input', value: dateStr(), max: dateStr() });
     const fxIn = h('input', { class: 'input', inputmode: 'decimal', value: numInput(s.fx, 6) });
-    const fijo = h('input', { type: 'checkbox' }); fijo.checked = p.precioFijo !== false;
+    const fijo = h('input', { type: 'checkbox' }); fijo.checked = p.precioFijo === true;
+    // Fecha del precio: por defecto el último día hábil (los fondos publican el precio de cada día al cerrar)
+    const lastBiz = (() => { let d = parseDate(dateStr()); while (d.getDay() === 0 || d.getDay() === 6) d = addDays(d, -1); return dateStr(d); })();
+    const fechaPrecio = h('input', { type: 'date', class: 'input', value: lastBiz, max: dateStr() });
     function save() {
       const v = manual ? evalAmount(valor.value) : parseNum(valor.value);
       if (!(v >= 0) || (!manual && !(v > 0))) { err.show('Escribe un valor válido.'); valor.focus(); return; }
@@ -3857,7 +3892,8 @@ export default {
       } else {
         const fx = cur === 'EUR' ? 1 : parseNum(fxIn.value);
         if (!(fx > 0)) { err.show('Indica el cambio.'); return; }
-        const upd = { precioPrevio: p.ultimoPrecio ?? null, ultimoPrecio: v, ultimoFx: fx, precioAt: Date.now(), precioManualAt: Date.now(), precioFecha: dateStr(), precioFijo: fijo.checked };
+        if (!fechaPrecio.value || fechaPrecio.value > dateStr()) { err.show('La fecha del precio no es válida.'); return; }
+        const upd = { precioPrevio: p.ultimoPrecio ?? null, ultimoPrecio: v, ultimoFx: fx, precioAt: Date.now(), precioManualAt: Date.now(), precioFecha: fechaPrecio.value, precioFijo: fijo.checked };
         updItem('inv', p.id, upd);
         openPosDetail({ ...p, ...upd }, { fetched: true });
       }
@@ -3867,8 +3903,9 @@ export default {
       h('p', { class: 'field-hint', style: { marginTop: 0 } }, manual ? 'Mira en tu plataforma cuánto vale ahora y escríbelo aquí.' : 'Escribe el precio actual por participación que veas en tu plataforma.'),
       field(manual ? 'Valor actual (€)' : `Precio actual (${cur})`, valor),
       manual ? field('Fecha', fecha) : null,
+      !manual ? field('Precio de la fecha', fechaPrecio, 'Pon el día al que corresponde ese precio. Mientras la cotización automática vaya por detrás de esa fecha, la app usa el tuyo; cuando la alcance, vuelve sola a la automática.') : null,
       !manual && cur !== 'EUR' ? field(`Cambio: euros por 1 ${cur}`, fxIn) : null,
-      !manual ? h('label', { class: 'check-field' }, fijo, h('span', {}, 'Mantener este precio (no lo cambian las cotizaciones automáticas)')) : null,
+      !manual ? h('label', { class: 'check-field' }, fijo, h('span', {}, 'Mantener este precio siempre (la cotización automática no lo cambia nunca)')) : null,
       err, h('div', { class: 'sheet-actions' }, h('button', { type: 'submit', class: 'btn btn-primary' }, 'Guardar'), h('button', { type: 'button', class: 'btn btn-ghost', onclick: () => openPosDetail(p) }, 'Volver')));
     openSheet(manual ? 'Actualizar valor' : 'Actualizar precio', form, valor);
   }
