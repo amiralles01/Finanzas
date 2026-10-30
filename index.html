@@ -869,10 +869,10 @@
     </div>
     <div class="section">
       <div class="section-head"><h2 class="section-title">Apuestas</h2></div>
-      <p class="section-sub">El profit de cada día de tu app de apuestas se suma como un movimiento a la cuenta que elijas. No copia el dinero de las casas ni depende de tus saldos: solo añade lo ganado o perdido, y si cambias o borras una apuesta allí, se corrige aquí. No toca nada más.</p>
+      <p class="section-sub">La cuenta que elijas tiene siempre el mismo saldo que tu bankroll en la app de apuestas (todas las casas y bancos, con lo que hay en apuestas pendientes). El profit de cada día entra como un movimiento y un ajuste de «Cuadre» pone el resto (ingresos, retiradas, correcciones). Si cambias algo allí, se corrige aquí solo. No cuenta como ingreso ni gasto.</p>
       <div class="list-box">
         <div class="settings-row"><div><span id="bets-status">No conectado</span><small id="bets-sub">Conecta tu cuenta de Google de la app de apuestas</small></div><button type="button" class="pill-btn is-primary" id="bets-connect">Conectar</button></div>
-        <div class="settings-row" id="bets-acc-row" hidden><div>Cuenta donde se suma<small>Suma o resta el profit de cada día; no cuenta como ingreso ni gasto</small></div><select class="input" id="bets-acc" style="max-width:190px"></select></div>
+        <div class="settings-row" id="bets-acc-row" hidden><div>Cuenta donde se suma<small>Su saldo será tu bankroll; no cuenta como ingreso ni gasto</small></div><select class="input" id="bets-acc" style="max-width:190px"></select></div>
       </div>
     </div>
     <div class="section">
@@ -898,7 +898,7 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/12.17.0/firebase-app.js";
   import {
     initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager,
-    collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, writeBatch, serverTimestamp, increment, getDocs, query, limit
+    collection, doc, onSnapshot, setDoc, updateDoc, deleteDoc, writeBatch, serverTimestamp, increment, getDoc, getDocs, query, limit
   } from "https://www.gstatic.com/firebasejs/12.17.0/firebase-firestore.js";
   import {
     getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut
@@ -4889,6 +4889,9 @@ export default {
     appId: "1:597066196263:web:e78b380d8af8e2ac30b502"
   };
   let betsAuth = null, betsDb = null, betsUser = null, betsData = null, betsUnsub = null, betsErr = '', betsTimer = null;
+  // La app de apuestas guarda en «data» solo lo reciente; las apuestas resueltas hace más de 3 días
+  // van a documentos de archivo (arc-AAAA-MM-1|2) listados en data.arc {parte: {h, n}}
+  let betsParts = new Map(), betsLoad = 0;
   const betsPath = (email) => (email || '').trim().toLowerCase().replace(/[@.]/g, '_');
   // Mismo cálculo que el calendario de la app de apuestas: profit resuelto por día, sin ocultas
   function betsDaily(d) {
@@ -4905,18 +4908,103 @@ export default {
       (c.history || []).forEach(h => { if (h.type === 'wd' && h.expense && h.amount > 0 && h.date >= tr.from) add(h.date, -Number(h.amount)); });
     });
     // gastos mensuales de cada casa: un cargo al mes en el día elegido
-    const hoy = new Date(); const hoyISO = `${hoy.getFullYear()}-${String(hoy.getMonth() + 1).padStart(2, '0')}-${String(hoy.getDate()).padStart(2, '0')}`;
-    (d.casas || []).forEach(c => { if (hid['casa:' + c.id]) return; (c.costs || []).forEach(k => {
+    if (tr) (d.casas || []).forEach(c => { if (hid['casa:' + c.id]) return; betsCostCharges(c).forEach(x => { if (x.date >= tr.from) add(x.date, -x.amount); }); });
+    for (const [k, v] of out) { const r = round2(v); if (Math.abs(r) < 0.005) out.delete(k); else out.set(k, r); }
+    return out;
+  }
+  // Cargos mensuales de una casa hasta hoy (como costCharges de la app de apuestas)
+  function betsCostCharges(c) {
+    const out = [], hoyISO = dateStr();
+    (c.costs || []).forEach(k => {
       if (!(k.amount > 0) || !k.from) return; let [y, m] = k.from.split('-').map(Number);
       for (let i = 0; i < 600; i++) {
         const ym = `${y}-${String(m).padStart(2, '0')}`; if (k.until && ym > k.until) break;
         const f = `${ym}-${String(Math.min(k.day || 1, new Date(y, m, 0).getDate())).padStart(2, '0')}`;
-        if (f > hoyISO) break; if (tr && f >= tr.from && f >= (k.start || '0')) add(f, -k.amount);
+        if (f > hoyISO) break; if (f >= (k.start || '0')) out.push({ date: f, amount: Number(k.amount) });
         m++; if (m > 12) { m = 1; y++; }
       }
-    }); });
-    for (const [k, v] of out) { const r = round2(v); if (Math.abs(r) < 0.005) out.delete(k); else out.set(k, r); }
+    });
     return out;
+  }
+  // Bankroll ahora, igual que «Bankroll now» en Profit de la app de apuestas: saldo de cada casa y banco
+  // (ingresado + resultados + correcciones − gastos mensuales del banco) + lo que hay en apuestas
+  // pendientes + lo que va de camino al banco. null si no tienes casas.
+  function betsBankroll(d) {
+    if (!d) return null;
+    const hid = d.hidden || {}, key = (s) => (s || '').trim().toLowerCase();
+    const casas = (d.casas || []).filter(c => c && !hid['casa:' + c.id]);
+    if (!casas.length) return null;
+    const led = new Map();
+    const g = (h) => { const k = key(h); if (!k) return null; if (!led.has(k)) led.set(k, { settled: 0, inPlay: 0 }); return led.get(k); };
+    const put = (h, v) => { const e = g(h); if (e) e.settled += Number(v) || 0; };
+    const play = (h, v) => { const e = g(h); if (e) e.inPlay += Number(v) || 0; };
+    // resultados resueltos por casa, y lo que hay en pendientes (sigue siendo tuyo)
+    (d.normals || []).forEach(n => {
+      if (!n || hid['nm:' + n.id]) return;
+      if (n.status === 'pending') play(n.house, n.type === 'Freebet' ? 0 : n.stake);
+      else if (n.status === 'won' || n.status === 'lost') put(n.house, n.profit);
+    });
+    (d.bets || []).forEach(b => {
+      if (!b || hid['sb:' + b.id]) return;
+      const legs = b.legs || []; if (!legs.length) return;
+      if (b.status === 'pending') { legs.forEach(l => play(l.house, l.stake)); return; }
+      if (b.status !== 'won' && b.status !== 'lost') return;
+      const w = b.winnerLeg;
+      if (b.cashOut != null && Array.isArray(b.cashOutLegs) && b.cashOutLegs.length === legs.length) {
+        legs.forEach((l, i) => put(l.house, (b.cashOutLegs[i] || 0) - (l.stake || 0)));
+      } else if (b.cashOut == null && w != null && legs[w]) {
+        legs.forEach((l, i) => put(l.house, i === w ? ((l.minReturn != null ? l.minReturn : (l.odd || 0) * (l.stake || 0)) - (l.stake || 0)) : -(l.stake || 0)));
+      } else {
+        const tot = legs.reduce((a, l) => a + (l.stake || 0), 0) || legs.length;
+        legs.forEach(l => put(l.house, (b.profit || 0) * ((l.stake || (tot === legs.length ? 1 : 0)) / tot)));
+      }
+    });
+    let total = 0;
+    casas.forEach(c => {
+      const bank = c.kind === 'bank';
+      const costs = bank ? betsCostCharges(c).reduce((a, x) => a + x.amount, 0) : 0;
+      const e = led.get(key(c.name)) || { settled: 0, inPlay: 0 };
+      // redondeado por casa como casaMoney, para que dé el mismo céntimo
+      total += round2((Number(c.amount) || 0) + e.settled + (Number(c.balAdj) || 0) - e.inPlay - round2(costs)) + round2(e.inPlay);
+      // dinero de camino al banco: sigue siendo tuyo
+      (c.history || []).forEach(h => { if (h && h.type === 'wd' && h.amount > 0 && !h.expense && !h.transfer && h.toBank && !h.transferDone) total += Number(h.amount); });
+    });
+    return round2(total);
+  }
+  // data + partes de archivo → una sola lista (si una apuesta sale en dos, gana la copia archivada, como en la app)
+  function betsMerge(main) {
+    const srcs = [...[...betsParts.values()].map(p => p.d || {}), main];
+    const out = { ...main };
+    ['bets', 'normals'].forEach(f => {
+      const seen = new Set(), arr = [];
+      srcs.forEach(s => (Array.isArray(s[f]) ? s[f] : []).forEach(x => {
+        if (!x || typeof x !== 'object') return;
+        if (x.id != null) { const k = JSON.stringify(x.id); if (seen.has(k)) return; seen.add(k); }
+        arr.push(x);
+      }));
+      out[f] = arr;
+    });
+    return out;
+  }
+  async function takeBets(snap, email) {
+    const my = ++betsLoad;
+    if (!snap.exists()) { betsParts = new Map(); betsErr = ''; betsData = null; renderBetsRow(); return; }
+    const main = snap.data();
+    const idx = main.arc && typeof main.arc === 'object' ? main.arc : {};
+    let failed = null;
+    await Promise.all(Object.keys(idx).map(async (k) => {
+      const want = idx[k] && idx[k].h, have = betsParts.get(k);
+      if (have && have.h === want) return;
+      try {
+        const s = await getDoc(doc(betsDb, 'users', betsPath(email), 'app', k));
+        betsParts.set(k, { h: want, d: s.exists() ? s.data() : {} });
+      } catch (err) { console.error('[apuestas] no se pudo leer', k, err); failed = err; }
+    }));
+    if (my !== betsLoad) return;   // llegó otra versión mientras tanto
+    for (const k of [...betsParts.keys()]) if (!idx[k]) betsParts.delete(k);
+    // con una parte sin leer no se toca nada: faltarían días y el bankroll saldría mal
+    if (failed) { betsErr = 'No se pudieron leer las apuestas antiguas: ' + describeError(failed); betsData = null; renderBetsRow(); return; }
+    betsErr = ''; betsData = betsMerge(main); renderBetsRow(); scheduleBetsSync();
   }
   // Cuenta destino: la elegida en Ajustes, o una cuenta «Apuestas» propia si no has elegido ninguna
   function betsTarget() {
@@ -4939,6 +5027,31 @@ export default {
       if (cur && cur.tipo === want.tipo && Number(cur.importe) === want.importe && cur.cuentaId === target && cur.ajuste === true && cur.fecha === fecha) continue;
       batch.set(docRef('movs', id), { ...want, t: cur?.t || Date.now(), createdAt: serverTimestamp() }); n++;
     }
+    // Cuadre: un ajuste que deja el saldo de la cuenta igual al bankroll de la app de apuestas.
+    // Lleva la fecha del primer día con profit, así el historial sigue la forma del profit diario.
+    const br = betsBankroll(betsData);
+    if (br != null) {
+      const eff = (id) => { const c = S.cuentas.find(x => x.id === id); return c && c.tipo === 'debito' && c.vinculadaA ? c.vinculadaA : id; };
+      let base = Number(S.cuentas.find(c => c.id === target)?.saldoInicial) || 0;
+      for (const m of S.movs) {
+        if (m.autoApuestas) continue;
+        const a = Number(m.importe) || 0;
+        if (m.tipo === 'ingreso' && eff(m.cuentaId) === target) base += a;
+        else if (m.tipo === 'gasto' && eff(m.cuentaId) === target) base -= a;
+        else if (m.tipo === 'transferencia') { if (eff(m.cuentaId) === target) base -= a; if (eff(m.cuentaDestinoId) === target) base += a; }
+      }
+      for (const v of daily.values()) base += v;
+      const diff = round2(br - base);
+      if (Math.abs(diff) >= 0.01) {
+        const id = 'apuestas-cuadre', fecha = [...daily.keys()].sort()[0] || dateStr();
+        const want = { tipo: diff > 0 ? 'ingreso' : 'gasto', importe: Math.abs(diff), cuentaId: target, cuentaDestinoId: null,
+          categoriaId: null, fecha, nota: 'Cuadre con el bankroll de la app de apuestas', ajuste: true, autoApuestas: true };
+        const cur = prev.get(id); prev.delete(id);
+        if (!(cur && cur.tipo === want.tipo && Number(cur.importe) === want.importe && cur.cuentaId === target && cur.ajuste === true && cur.fecha === fecha)) {
+          batch.set(docRef('movs', id), { ...want, t: cur?.t || Date.now(), createdAt: serverTimestamp() }); n++;
+        }
+      }
+    }
     for (const id of prev.keys()) { batch.delete(docRef('movs', id)); n++; }
     if (n) batch.commit().catch(fsErr);
     renderBetsRow();
@@ -4958,17 +5071,18 @@ export default {
     if (betsErr) { st.textContent = 'Error al leer las apuestas'; sub.textContent = betsErr; return; }
     const days = betsDaily(betsData); let tot = 0; for (const v of days.values()) tot += v;
     st.textContent = !betsTarget() ? 'Conectado · elige la cuenta donde sumar' : `Conectado · ${betsData ? days.size + ' días con resultado' : 'sin datos todavía'}`;
-    sub.textContent = `${betsUser.email} · total ${money(round2(tot))}`;
+    const br = betsBankroll(betsData);
+    sub.textContent = `${betsUser.email} · profit ${money(round2(tot))}` + (br != null ? ` · bankroll ${money(br)}` : '');
   }
   function initBets() {
     const app2 = initializeApp(BETS_CONFIG, 'apuestas');
     betsAuth = getAuth(app2);
     betsDb = getFirestore(app2);
     onAuthStateChanged(betsAuth, (u) => {
-      betsUser = u; betsData = null; betsErr = '';
+      betsUser = u; betsData = null; betsErr = ''; betsParts = new Map(); betsLoad++;
       if (betsUnsub) { betsUnsub(); betsUnsub = null; }
       if (u) betsUnsub = onSnapshot(doc(betsDb, 'users', betsPath(u.email), 'app', 'data'),
-        (snap) => { betsErr = ''; betsData = snap.exists() ? snap.data() : null; renderBetsRow(); scheduleBetsSync(); },
+        (snap) => { takeBets(snap, u.email).catch(err => { console.error(err); betsErr = describeError(err); renderBetsRow(); }); },
         (err) => { console.error(err); betsErr = describeError(err); renderBetsRow(); });
       renderBetsRow();
     });
