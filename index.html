@@ -4916,19 +4916,31 @@ export default {
   function betsCostCharges(c) {
     const out = [], hoyISO = dateStr();
     (c.costs || []).forEach(k => {
-      if (!(k.amount > 0) || !k.from) return; let [y, m] = k.from.split('-').map(Number);
+      if (!k.from || !(k.amount > 0 || k.amts)) return; let [y, m] = k.from.split('-').map(Number);
       for (let i = 0; i < 600; i++) {
         const ym = `${y}-${String(m).padStart(2, '0')}`; if (k.until && ym > k.until) break;
         const f = `${ym}-${String(Math.min(k.day || 1, new Date(y, m, 0).getDate())).padStart(2, '0')}`;
-        if (f > hoyISO) break; if (f >= (k.start || '0')) out.push({ date: f, amount: Number(k.amount) });
+        if (f > hoyISO) break;
+        // un mes puede tener su propio precio (k.amts {'2026-09': 35}); 0 = ese mes no se cobra
+        const amt = k.amts && k.amts[ym] != null ? Number(k.amts[ym]) : (Number(k.amount) || 0);
+        if (f >= (k.start || '0') && amt > 0) out.push({ date: f, amount: amt });
         m++; if (m > 12) { m = 1; y++; }
       }
     });
     return out;
   }
-  // Todo el dinero de apuestas: saldo de cada casa y de cada banco de la app de apuestas (ingresado + resultados
-  // + correcciones − gastos mensuales del banco) + lo que hay en apuestas pendientes + retiradas que aún no han
-  // llegado (al banco o a ti). Como casaMoney() + casaPendIn() de la app de apuestas. null si no tienes casas.
+  // ¿Ganó esta pata? (como legWins/sbHasWin de la app de apuestas: varias patas, grupos g, middles «both»)
+  function betsLegWins(b, w, i) {
+    if (Array.isArray(w)) return w.some(x => betsLegWins(b, x, i));
+    if (w === 'both') return !!b.mid;
+    if (w === i) return true;
+    const L = b.legs || []; return typeof w === 'number' && !!L[w] && !!L[i] && L[w].g != null && L[i].g === L[w].g;
+  }
+  function betsHasWin(b, w) { const L = b.legs || []; return typeof w === 'number' ? !!L[w] : Array.isArray(w) && w.length > 0 && w.every(i => !!L[i]); }
+  // Saldo de apuestas = «Bankroll now» de la app de apuestas (bankrollSummary: bankroll + inTransit):
+  // saldo de cada casa y banco (ingresado + resultados + correcciones − gastos mensuales del banco)
+  // + lo que hay en apuestas pendientes + retiradas de camino al banco. null si no tienes casas.
+  // Copia exacta de bookmakerLedger()/casaMoney()/bankrollSummary(): si cambian allí, cámbialo aquí.
   function betsBankroll(d) {
     if (!d) return null;
     const hid = d.hidden || {}, key = (s) => (s || '').trim().toLowerCase();
@@ -4938,22 +4950,29 @@ export default {
     const g = (h) => { const k = key(h); if (!k) return null; if (!led.has(k)) led.set(k, { settled: 0, inPlay: 0 }); return led.get(k); };
     const put = (h, v) => { const e = g(h); if (e) e.settled += Number(v) || 0; };
     const play = (h, v) => { const e = g(h); if (e) e.inPlay += Number(v) || 0; };
-    // resultados resueltos por casa, y lo que hay en pendientes (sigue siendo tuyo)
+    const ret = (l) => l.minReturn != null ? l.minReturn : (l.odd || 0) * (l.stake || 0);
     (d.normals || []).forEach(n => {
       if (!n || hid['nm:' + n.id]) return;
-      if (n.status === 'pending') play(n.house, n.type === 'Freebet' ? 0 : n.stake);
-      else if (n.status === 'won' || n.status === 'lost') put(n.house, n.profit);
+      if (n.status === 'pending') play(n.house, n.type === 'Freebet' ? 0 : (n.stake || 0));
+      else if (n.status === 'won' || n.status === 'lost') put(n.house, n.profit || 0);
     });
     (d.bets || []).forEach(b => {
       if (!b || hid['sb:' + b.id]) return;
       const legs = b.legs || []; if (!legs.length) return;
-      if (b.status === 'pending') { legs.forEach(l => play(l.house, l.stake)); return; }
+      if (b.status === 'pending') {
+        // cash out parcial: las patas ya cobradas están en la cuenta
+        const cp = Array.isArray(b.coPart) && b.coPart.length === legs.length && b.coPart.some(x => x != null) ? b.coPart : null;
+        legs.forEach((l, i) => { if (cp && cp[i] != null) put(l.house, cp[i] - (l.stake || 0)); else play(l.house, l.stake || 0); });
+        return;
+      }
       if (b.status !== 'won' && b.status !== 'lost') return;
       const w = b.winnerLeg;
       if (b.cashOut != null && Array.isArray(b.cashOutLegs) && b.cashOutLegs.length === legs.length) {
         legs.forEach((l, i) => put(l.house, (b.cashOutLegs[i] || 0) - (l.stake || 0)));
-      } else if (b.cashOut == null && w != null && legs[w]) {
-        legs.forEach((l, i) => put(l.house, i === w ? ((l.minReturn != null ? l.minReturn : (l.odd || 0) * (l.stake || 0)) - (l.stake || 0)) : -(l.stake || 0)));
+      } else if (b.cashOut == null && w === 'both' && b.mid) {
+        legs.forEach(l => put(l.house, ret(l) - (l.stake || 0)));
+      } else if (b.cashOut == null && betsHasWin(b, w)) {
+        legs.forEach((l, i) => put(l.house, betsLegWins(b, w, i) ? ret(l) - (l.stake || 0) : -(l.stake || 0)));
       } else {
         const tot = legs.reduce((a, l) => a + (l.stake || 0), 0) || legs.length;
         legs.forEach(l => put(l.house, (b.profit || 0) * ((l.stake || (tot === legs.length ? 1 : 0)) / tot)));
@@ -4961,13 +4980,14 @@ export default {
     });
     let total = 0;
     casas.forEach(c => {
-      const costs = c.kind === 'bank' ? betsCostCharges(c).reduce((a, x) => a + x.amount, 0) : 0;
+      const costs = c.kind === 'bank' ? round2(betsCostCharges(c).reduce((a, x) => a + x.amount, 0)) : 0;
       const e = led.get(key(c.name)) || { settled: 0, inPlay: 0 };
       // redondeado por casa como casaMoney, para que dé el mismo céntimo
-      total += round2((Number(c.amount) || 0) + e.settled + (Number(c.balAdj) || 0) - e.inPlay - round2(costs)) + round2(e.inPlay);
-      // retiradas que aún no han llegado (pendientes, o de camino al banco) y el «pendiente de recibir» antiguo: siguen siendo tuyas
-      const pend = (c.history || []).filter(h => h && h.type === 'wd' && (h.status === 'pending' || (h.toBank && !h.transferDone && !h.expense && !h.transfer))).reduce((a, h) => a + (Number(h.amount) || 0), 0);
-      total += round2((Number(c.pendingTransfer) || 0) + round2(pend));
+      total += round2((Number(c.amount) || 0) + e.settled + (Number(c.balAdj) || 0) - e.inPlay - costs) + round2(e.inPlay);
+      // retiradas de camino al banco (aún no pasadas): siguen siendo tuyas
+      (c.history || []).forEach(h => {
+        if (h && h.type === 'wd' && Number(h.amount) > 0 && !h.expense && !h.transfer && h.toBank && !h.transferDone) total += Number(h.amount);
+      });
     });
     return round2(total);
   }
@@ -5045,7 +5065,7 @@ export default {
       if (Math.abs(diff) >= 0.01) {
         const id = 'apuestas-cuadre', fecha = [...daily.keys()].sort()[0] || dateStr();
         const want = { tipo: diff > 0 ? 'ingreso' : 'gasto', importe: Math.abs(diff), cuentaId: target, cuentaDestinoId: null,
-          categoriaId: null, fecha, nota: 'Cuadre con el dinero de apuestas (casas + banco)', ajuste: true, autoApuestas: true };
+          categoriaId: null, fecha, nota: 'Cuadre con el Bankroll now de la app de apuestas', ajuste: true, autoApuestas: true };
         const cur = prev.get(id); prev.delete(id);
         if (!(cur && cur.tipo === want.tipo && Number(cur.importe) === want.importe && cur.cuentaId === target && cur.ajuste === true && cur.fecha === fecha)) {
           batch.set(docRef('movs', id), { ...want, t: cur?.t || Date.now(), createdAt: serverTimestamp() }); n++;
